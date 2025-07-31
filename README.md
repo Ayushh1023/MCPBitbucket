@@ -6,10 +6,11 @@ A Model Context Protocol (MCP) server built with FastMCP that provides access to
 
 - **Authentication**: Secure authentication with Bitbucket using email and personal access token
 - **Workspace Management**: List and access Bitbucket workspaces
-- **Repository Access**: Browse repositories with pagination support
+- **Repository Access**: Browse repositories with pagination support and fetch from all workspaces
 - **Codebase Exploration**: Get complete repository structure and file contents
 - **File Operations**: Retrieve specific file contents and list all files
 - **Export Functionality**: Save codebase structures to JSON files
+- **Optimized Architecture**: Internal functions prevent tool-to-tool calls and enable code reuse
 
 ## Setup
 
@@ -74,12 +75,29 @@ Get list of workspaces the user has access to.
 Get list of repositories.
 
 **Parameters:**
-- `workspace` (optional string): Workspace slug (if not provided, gets user's repositories)
+- `workspace` (optional string): Workspace slug (if not provided, gets repositories from all workspaces)
 - `page_size` (int): Number of repositories per page (default: 50)
 
-**Returns:** List of repositories with metadata
+**Returns:** List of repositories with metadata and workspace details when fetching from all workspaces
 
-### 4. `get_repository_codebase`
+### 4. `get_all_repositories_with_workspaces`
+Get repositories from all workspaces with detailed workspace information.
+
+**Parameters:**
+- `page_size` (int): Number of repositories per page per workspace (default: 50)
+
+**Returns:** Detailed information about repositories organized by workspaces
+
+### 5. `get_repository_branches`
+Get list of branches from a repository.
+
+**Parameters:**
+- `workspace` (string): Workspace name/slug
+- `repo_slug` (string): Repository slug
+
+**Returns:** List of branches with details, commit information, and default branch identification
+
+### 6. `get_repository_codebase`
 Get the complete codebase structure and contents of a repository.
 
 **Parameters:**
@@ -87,10 +105,23 @@ Get the complete codebase structure and contents of a repository.
 - `repo_slug` (string): Repository slug
 - `branch` (string): Branch name (default: 'main')
 - `path` (string): Path within the repository (default: root)
+- `max_items` (optional int): Maximum number of files/directories to return (for pagination)
 
-**Returns:** Complete repository structure with file contents
+**Returns:** Complete repository structure with file contents, or list of available branches if multiple branches exist and no specific branch is specified
 
-### 5. `get_specific_file_content`
+### 7. `get_repository_codebase_paginated`
+Get a limited number of files/directories from a repository codebase (paginated).
+
+**Parameters:**
+- `workspace` (string): Workspace name/slug
+- `repo_slug` (string): Repository slug
+- `max_items` (int): Maximum number of files/directories to return (required for pagination)
+- `branch` (string): Branch name (default: 'main')
+- `path` (string): Path within the repository (default: root)
+
+**Returns:** Repository structure with limited file contents, or list of available branches if multiple branches exist and no specific branch is specified
+
+### 8. `get_specific_file_content`
 Get the content of a specific file from a repository.
 
 **Parameters:**
@@ -101,7 +132,7 @@ Get the content of a specific file from a repository.
 
 **Returns:** File content and metadata
 
-### 6. `get_repository_files_list`
+### 9. `get_repository_files_list`
 Get a list of all files in a repository (without content).
 
 **Parameters:**
@@ -112,7 +143,28 @@ Get a list of all files in a repository (without content).
 
 **Returns:** List of all files and code files separately
 
-### 7. `save_codebase_to_file`
+### 9. `get_pull_requests`
+Get pull requests from a repository.
+
+**Parameters:**
+- `workspace` (string): Workspace name/slug
+- `repo_slug` (string): Repository slug
+- `state` (string): PR state (OPEN, MERGED, DECLINED, SUPERSEDED) - default: OPEN
+- `page_size` (int): Number of PRs per page (default: 50)
+
+**Returns:** List of pull requests with details
+
+### 10. `get_pull_request_files`
+Get files changed in a pull request.
+
+**Parameters:**
+- `workspace` (string): Workspace name/slug
+- `repo_slug` (string): Repository slug
+- `pr_id` (int): Pull Request ID
+
+**Returns:** List of files changed in the PR with change details and categorization
+
+### 11. `save_codebase_to_file`
 Save the codebase structure to a JSON file.
 
 **Parameters:**
@@ -121,6 +173,7 @@ Save the codebase structure to a JSON file.
 - `filename` (string): Local filename to save to
 - `branch` (string): Branch name (default: 'main')
 - `path` (string): Path within the repository (default: root)
+- `max_items` (optional int): Maximum number of files/directories to save (for pagination)
 
 **Returns:** Success status and file information
 
@@ -136,9 +189,78 @@ Save the codebase structure to a JSON file.
 3. **Use the tools:**
    - First authenticate (email will be used from config if available)
    - Get your workspaces
-   - Browse repositories
+   - Browse repositories (now fetches from all workspaces by default)
    - Explore codebases
    - Retrieve specific files
+
+## Testing the Optimizations
+
+Run the test script to verify the optimized functionality:
+
+```bash
+python test_optimized_server.py
+```
+
+This will test:
+- Fetching repositories from all workspaces
+- Comparing results between different methods
+- Verifying the internal function architecture works correctly
+
+## Testing Codebase Pagination
+
+Run the pagination test script to verify the new codebase pagination functionality:
+
+```bash
+python test_codebase_pagination_fixed.py
+```
+
+This will test:
+- Pagination with different limits (5, 10, 20 items)
+- Comparison between paginated and full codebase results
+- Saving paginated codebase to files
+- Performance benefits of limiting the number of files/directories
+
+**Note**: The test scripts use internal functions directly for testing purposes. The MCP tools are designed to be called through the MCP protocol, not directly as Python functions.
+
+## Testing Branch Functionality
+
+Run the branch test script to verify the new branch fetching functionality:
+
+```bash
+python test_branch_functionality.py
+```
+
+This will test:
+- Fetching repository branches with commit details
+- Default branch identification
+- Codebase fetching with different branches
+- Error handling for non-existent branches
+
+## Architecture Optimizations
+
+The server has been optimized with the following improvements:
+
+### Internal Functions
+- **`_authenticate_internal()`**: Internal authentication function used by other functions
+- **`_get_workspaces_internal()`**: Internal workspace fetching function
+- **`_get_repositories_from_workspace_internal()`**: Internal repository fetching for specific workspaces
+- **`_get_user_repositories_internal()`**: Internal user repository fetching
+- **`_get_repository_branches_internal()`**: Internal branch fetching function
+- **`_get_repository_codebase_internal()`**: Internal codebase structure fetching
+- **`_get_specific_file_content_internal()`**: Internal file content fetching
+- **`_get_repository_files_list_internal()`**: Internal file list fetching
+- **`_get_pull_requests_internal()`**: Internal pull request fetching
+- **`_get_pull_request_files_internal()`**: Internal pull request file changes fetching
+
+### Benefits
+- **No Tool-to-Tool Calls**: Internal functions prevent MCP tools from calling other tools
+- **Code Reuse**: Common functionality is shared through internal functions
+- **Better Error Handling**: Consistent error handling across all functions
+- **Automatic Authentication**: Functions can automatically authenticate if credentials are configured
+- **Enhanced Repository Fetching**: `get_repositories()` now fetches from all workspaces when no specific workspace is provided
+- **Branch Management**: New tools for fetching repository branches and intelligent branch selection
+- **Pull Request Management**: New tools for fetching PRs and analyzing file changes
+- **Codebase Pagination**: Support for limiting the number of files/directories returned to improve performance
 
 ## Security Notes
 
