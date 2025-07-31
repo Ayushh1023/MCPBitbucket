@@ -57,16 +57,10 @@ def get_headers_with_email(email: str) -> Dict[str, str]:
         "Authorization": f"Basic {encoded_credentials}"
     }
 
-@mcp.tool()
-async def authenticate_user(email: str = None) -> Dict[str, Any]:
+def _authenticate_internal(email: str = None) -> Dict[str, Any]:
     """
-    Authenticate with Bitbucket using email and token
-    
-    Args:
-        email: Your Bitbucket email address (optional, will use config if not provided)
-    
-    Returns:
-        User information if authentication successful
+    Internal authentication function (not an MCP tool)
+    Used by other functions to authenticate automatically
     """
     global auth_headers
     
@@ -77,7 +71,7 @@ async def authenticate_user(email: str = None) -> Dict[str, Any]:
         else:
             return {
                 "success": False,
-                "error": "No email provided and BITBUCKET_EMAIL not configured. Please provide an email parameter or set BITBUCKET_EMAIL in your configuration."
+                "error": "No email provided and BITBUCKET_EMAIL not configured."
             }
     
     try:
@@ -107,7 +101,22 @@ async def authenticate_user(email: str = None) -> Dict[str, Any]:
             "error": f"Exception during authentication: {str(e)}"
         }
 
-@mcp.tool()
+@mcp.tool(name="authenticate_user", description="Authenticate with Bitbucket using email and token")
+async def authenticate_user(email: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Authenticate with Bitbucket using email and token
+    
+    Args:
+        email: Your Bitbucket email address (optional, will use config if not provided)
+    
+    Returns:
+        User information if authentication successful
+    """
+    # Use the internal authentication function
+    result = _authenticate_internal(email)
+    return result
+
+@mcp.tool(name="get_workspaces", description="Get list of workspaces the user has access to")
 async def get_workspaces() -> Dict[str, Any]:
     """
     Get list of workspaces the user has access to
@@ -120,7 +129,7 @@ async def get_workspaces() -> Dict[str, Any]:
     if not auth_headers:
         # Try to authenticate automatically if email is configured
         if BITBUCKET_EMAIL:
-            auth_result = await authenticate_user()
+            auth_result = _authenticate_internal()
             if not auth_result.get("success"):
                 return auth_result
         else:
@@ -155,7 +164,7 @@ async def get_workspaces() -> Dict[str, Any]:
             "error": f"Exception while getting workspaces: {str(e)}"
         }
 
-@mcp.tool()
+@mcp.tool(name="get_repositories", description="Get list of repositories from a workspace or user account")
 async def get_repositories(workspace: Optional[str] = None, page_size: int = 50) -> Dict[str, Any]:
     """
     Get list of repositories
@@ -172,7 +181,7 @@ async def get_repositories(workspace: Optional[str] = None, page_size: int = 50)
     if not auth_headers:
         # Try to authenticate automatically if email is configured
         if BITBUCKET_EMAIL:
-            auth_result = await authenticate_user()
+            auth_result = _authenticate_internal()
             if not auth_result.get("success"):
                 return auth_result
         else:
@@ -223,7 +232,7 @@ async def get_repositories(workspace: Optional[str] = None, page_size: int = 50)
             "error": f"Exception while getting repositories: {str(e)}"
         }
 
-@mcp.tool()
+@mcp.tool(name="get_repository_codebase", description="Get the complete codebase structure and contents of a repository")
 async def get_repository_codebase(workspace: str, repo_slug: str, branch: str = "main", path: str = "") -> Dict[str, Any]:
     """
     Get the codebase structure and contents of a repository
@@ -324,7 +333,7 @@ async def get_repository_codebase(workspace: str, repo_slug: str, branch: str = 
             "error": f"Exception while getting codebase: {str(e)}"
         }
 
-@mcp.tool()
+@mcp.tool(name="get_specific_file_content", description="Get the content of a specific file from a repository")
 async def get_specific_file_content(workspace: str, repo_slug: str, file_path: str, branch: str = "main") -> Dict[str, Any]:
     """
     Get the content of a specific file from a repository
@@ -343,7 +352,7 @@ async def get_specific_file_content(workspace: str, repo_slug: str, file_path: s
     if not auth_headers:
         # Try to authenticate automatically if email is configured
         if BITBUCKET_EMAIL:
-            auth_result = await authenticate_user()
+            auth_result = _authenticate_internal()
             if not auth_result.get("success"):
                 return auth_result
         else:
@@ -381,7 +390,7 @@ async def get_specific_file_content(workspace: str, repo_slug: str, file_path: s
             "error": f"Exception while fetching {file_path}: {str(e)}"
         }
 
-@mcp.tool()
+@mcp.tool(name="get_repository_files_list", description="Get a list of all files in a repository without content")
 async def get_repository_files_list(workspace: str, repo_slug: str, branch: str = "main", path: str = "") -> Dict[str, Any]:
     """
     Get a list of all files in a repository (without content)
@@ -400,7 +409,7 @@ async def get_repository_files_list(workspace: str, repo_slug: str, branch: str 
     if not auth_headers:
         # Try to authenticate automatically if email is configured
         if BITBUCKET_EMAIL:
-            auth_result = await authenticate_user()
+            auth_result = _authenticate_internal()
             if not auth_result.get("success"):
                 return auth_result
         else:
@@ -467,7 +476,7 @@ async def get_repository_files_list(workspace: str, repo_slug: str, branch: str 
             "error": f"Exception while getting files list: {str(e)}"
         }
 
-@mcp.tool()
+@mcp.tool(name="save_codebase_to_file", description="Save the repository codebase structure to a JSON file")
 async def save_codebase_to_file(workspace: str, repo_slug: str, filename: str, branch: str = "main", path: str = "") -> Dict[str, Any]:
     """
     Save the codebase structure to a JSON file
@@ -482,14 +491,86 @@ async def save_codebase_to_file(workspace: str, repo_slug: str, filename: str, b
     Returns:
         Success status and file information
     """
+    global auth_headers
+    
+    if not auth_headers:
+        # Try to authenticate automatically if email is configured
+        if BITBUCKET_EMAIL:
+            auth_result = _authenticate_internal()
+            if not auth_result.get("success"):
+                return auth_result
+        else:
+            return {
+                "success": False,
+                "error": "Not authenticated. Please authenticate first using authenticate_user() or configure BITBUCKET_EMAIL."
+            }
+    
+    # Manually get the codebase structure (don't call another tool)
+    base_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}"
+    
+    def get_file_contents(file_path: str) -> str:
+        """Get contents of a specific file"""
+        try:
+            response = requests.get(
+                f"{base_url}/src/{branch}/{file_path}",
+                headers=auth_headers
+            )
+            if response.status_code == 200:
+                return response.text
+            else:
+                return f"Error: Could not fetch file {file_path} (Status: {response.status_code})"
+        except Exception as e:
+            return f"Error: Exception while fetching {file_path}: {str(e)}"
+    
+    def get_directory_structure(dir_path: str = '') -> Optional[Dict[str, Any]]:
+        """Recursively get directory structure"""
+        try:
+            response = requests.get(
+                f"{base_url}/src/{branch}/{dir_path}",
+                headers=auth_headers
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                structure = {
+                    'type': 'directory',
+                    'path': dir_path,
+                    'children': []
+                }
+                
+                for item in data.get('values', []):
+                    item_type = item.get('type', 'unknown')
+                    item_path = item.get('path', '')
+                    
+                    if item_type == 'commit_file':
+                        # It's a file
+                        file_info = {
+                            'type': 'file',
+                            'path': item_path,
+                            'size': item.get('size', 0),
+                            'content': get_file_contents(item_path) if item_path.endswith(('.py', '.js', '.ts', '.java', '.cpp', '.c', '.h', '.html', '.css', '.json', '.xml', '.md', '.txt', '.yml', '.yaml', '.sh', '.bat', '.ps1')) else None
+                        }
+                        structure['children'].append(file_info)
+                    elif item_type == 'commit_directory':
+                        # It's a directory, recurse
+                        sub_structure = get_directory_structure(item_path)
+                        if sub_structure:
+                            structure['children'].append(sub_structure)
+                
+                return structure
+            else:
+                return None
+                
+        except Exception as e:
+            return None
+    
     try:
-        # Get the codebase structure first
-        codebase_result = await get_repository_codebase(workspace, repo_slug, branch, path)
-        
-        if not codebase_result.get("success"):
-            return codebase_result
-        
-        structure = codebase_result["structure"]
+        structure = get_directory_structure(path)
+        if not structure:
+            return {
+                "success": False,
+                "error": "Failed to get codebase structure"
+            }
         
         from datetime import datetime
         timestamp = datetime.now().isoformat()
