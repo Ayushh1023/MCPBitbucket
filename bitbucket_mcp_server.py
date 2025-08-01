@@ -65,6 +65,22 @@ class PullRequestFilesRequest(BaseModel):
     repo_slug: str = Field(..., description="Repository slug")
     pr_id: int = Field(..., description="Pull Request ID")
 
+class PullRequestDetailsRequest(BaseModel):
+    workspace: str = Field(..., description="Workspace slug")
+    repo_slug: str = Field(..., description="Repository slug")
+    pr_id: int = Field(..., description="Pull Request ID")
+
+class PullRequestSearchRequest(BaseModel):
+    workspace: str = Field(..., description="Workspace slug")
+    repo_slug: str = Field(..., description="Repository slug")
+    search_query: str = Field(..., description="Search query to match against PR titles")
+    state: str = Field("OPEN", description="PR state: OPEN, MERGED, DECLINED, SUPERSEDED")
+    page_size: int = Field(50, description="Number of PRs per page")
+
+class RepositorySearchRequest(BaseModel):
+    repo_name: str = Field(..., description="Repository name or slug to search for")
+    page_size: int = Field(50, description="Number of repositories per page per workspace")
+
 class BranchRequest(BaseModel):
     workspace: str = Field(..., description="Workspace slug")
     repo_slug: str = Field(..., description="Repository slug")
@@ -286,6 +302,84 @@ def _get_user_repositories_internal(page_size: int = 50) -> Dict[str, Any]:
             "error": f"Exception while getting user repositories: {str(e)}"
         }
 
+def _find_repository_across_workspaces_internal(repo_name: str, page_size: int = 50) -> Dict[str, Any]:
+    """
+    Internal function to find a repository by name across all workspaces (not an MCP tool)
+    Used by other functions to locate repositories when only the name is provided
+    """
+    global auth_headers
+    
+    if not auth_headers:
+        # Try to authenticate automatically if email is configured
+        if BITBUCKET_EMAIL:
+            auth_result = _authenticate_internal()
+            if not auth_result.get("success"):
+                return auth_result
+        else:
+            return {
+                "success": False,
+                "error": "Not authenticated. Please authenticate first using authenticate_user() or configure BITBUCKET_EMAIL."
+            }
+    
+    try:
+        # First get all workspaces
+        workspaces_result = _get_workspaces_internal()
+        if not workspaces_result.get("success"):
+            return workspaces_result
+        
+        workspaces = workspaces_result.get("workspaces", [])
+        matching_repos = []
+        
+        # Search through each workspace
+        for workspace_info in workspaces:
+            workspace_slug = workspace_info.get('slug')
+            workspace_name = workspace_info.get('name')
+            
+            # Get repositories from this workspace
+            repos_result = _get_repositories_from_workspace_internal(workspace_slug, page_size)
+            
+            if repos_result.get("success"):
+                repos = repos_result.get("repositories", [])
+                
+                # Look for repositories that match the name (case-insensitive)
+                repo_name_lower = repo_name.lower()
+                for repo in repos:
+                    repo_slug = repo.get('slug', '').lower()
+                    repo_name_from_api = repo.get('name', '').lower()
+                    
+                    # Check if the repository name matches (either slug or name)
+                    if (repo_name_lower == repo_slug or 
+                        repo_name_lower == repo_name_from_api or
+                        repo_name_lower in repo_slug or
+                        repo_name_lower in repo_name_from_api):
+                        
+                        matching_repos.append({
+                            "workspace_slug": workspace_slug,
+                            "workspace_name": workspace_name,
+                            "repository": repo
+                        })
+        
+        if matching_repos:
+            return {
+                "success": True,
+                "repo_name": repo_name,
+                "matches": matching_repos,
+                "count": len(matching_repos)
+            }
+        else:
+            return {
+                "success": False,
+                "error": f"Repository '{repo_name}' not found in any workspace",
+                "repo_name": repo_name,
+                "workspaces_searched": len(workspaces)
+            }
+            
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Exception while searching for repository '{repo_name}': {str(e)}"
+        }
+
 def _get_repository_branches_internal(workspace: str, repo_slug: str) -> Dict[str, Any]:
     """
     Internal function to get branches from a repository (not an MCP tool)
@@ -491,6 +585,20 @@ async def get_all_repositories_with_workspaces(page_size: int = 50) -> Dict[str,
         "workspace_details": workspace_repos_map
     }
 
+@mcp.tool(name="find_repository", description="Find a repository by name across all workspaces")
+async def find_repository(repo_name: str, page_size: int = 50) -> Dict[str, Any]:
+    """
+    Find a repository by name across all workspaces
+    
+    Args:
+        repo_name: Repository name or slug to search for (case-insensitive)
+        page_size: Number of repositories per page per workspace
+    
+    Returns:
+        List of matching repositories with their workspace information
+    """
+    return _find_repository_across_workspaces_internal(repo_name, page_size)
+
 @mcp.tool(name="get_repository_branches", description="Get list of branches from a repository")
 async def get_repository_branches(workspace: str, repo_slug: str) -> Dict[str, Any]:
     """
@@ -528,10 +636,68 @@ def _get_repository_codebase_internal(workspace: str, repo_slug: str, branch: st
     
     base_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}"
     
+    # First, check if we can access the repository at all
+    try:
+        repo_response = requests.get(base_url, headers=auth_headers)
+        if repo_response.status_code == 404:
+            return {
+                "success": False,
+                "error": f"Repository '{repo_slug}' not found or you don't have access to it. Please check the repository name and your permissions."
+            }
+        elif repo_response.status_code != 200:
+            return {
+                "success": False,
+                "error": f"Cannot access repository '{repo_slug}' (Status: {repo_response.status_code}). You may need additional permissions."
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Exception while checking repository access: {str(e)}"
+        }
+    
+    # Check available branches first
+    try:
+        branches_response = requests.get(f"{base_url}/refs/branches", headers=auth_headers)
+        if branches_response.status_code == 200:
+            branches_data = branches_response.json()
+            available_branches = [b.get('name') for b in branches_data.get('values', [])]
+            
+            # If the requested branch doesn't exist, try to find a suitable default
+            if branch not in available_branches:
+                # Try common default branches
+                for default_branch in ['main', 'master', 'develop', 'dev']:
+                    if default_branch in available_branches:
+                        branch = default_branch
+                        break
+                else:
+                    # If no common branch found, use the first available
+                    if available_branches:
+                        branch = available_branches[0]
+                    else:
+                        return {
+                            "success": False,
+                            "error": f"No branches found in repository '{repo_slug}'. Available branches: {available_branches}"
+                        }
+        else:
+            # If we can't get branches, assume the branch exists and try anyway
+            pass
+    except Exception as e:
+        # If we can't get branches, assume the branch exists and try anyway
+        pass
+    
     # Global counters for pagination
     total_items_count = 0
     files_count = 0
     directories_count = 0
+    pagination_limit_reached = False
+    
+    def count_items_in_structure(structure: Dict[str, Any]) -> int:
+        """Count total items in a structure (files + directories) - only top level"""
+        count = 0
+        if structure.get("children"):
+            for child in structure["children"]:
+                count += 1
+        return count
     
     def get_file_contents(file_path: str) -> str:
         """Get contents of a specific file"""
@@ -549,7 +715,7 @@ def _get_repository_codebase_internal(workspace: str, repo_slug: str, branch: st
     
     def get_directory_structure(dir_path: str = '') -> Optional[Dict[str, Any]]:
         """Recursively get directory structure"""
-        nonlocal total_items_count, files_count, directories_count
+        nonlocal total_items_count, files_count, directories_count, pagination_limit_reached
         
         try:
             response = requests.get(
@@ -566,8 +732,13 @@ def _get_repository_codebase_internal(workspace: str, repo_slug: str, branch: st
                 }
                 
                 for item in data.get('values', []):
-                    # Check if we've reached the max_items limit
+                    # Check if we've reached the pagination limit
+                    if pagination_limit_reached:
+                        break
+                    
+                    # Check if we've reached the max_items limit BEFORE processing
                     if max_items is not None and total_items_count >= max_items:
+                        pagination_limit_reached = True
                         break
                     
                     item_type = item.get('type', 'unknown')
@@ -584,15 +755,32 @@ def _get_repository_codebase_internal(workspace: str, repo_slug: str, branch: st
                         structure['children'].append(file_info)
                         total_items_count += 1
                         files_count += 1
+                        
+                        # Check again after adding the file
+                        if max_items is not None and total_items_count >= max_items:
+                            pagination_limit_reached = True
+                            break
+                            
                     elif item_type == 'commit_directory':
                         # It's a directory, recurse
                         sub_structure = get_directory_structure(item_path)
                         if sub_structure:
                             structure['children'].append(sub_structure)
+                            # Count the directory itself (not its contents)
                             total_items_count += 1
                             directories_count += 1
+                            
+                            # Check again after adding the directory
+                            if max_items is not None and total_items_count >= max_items:
+                                pagination_limit_reached = True
+                                break
                 
                 return structure
+            elif response.status_code == 404:
+                # Try to provide a more helpful error message
+                error_data = response.json() if response.text else {}
+                error_message = error_data.get('error', {}).get('message', 'Repository or branch not found')
+                return None
             else:
                 return None
                 
@@ -602,10 +790,13 @@ def _get_repository_codebase_internal(workspace: str, repo_slug: str, branch: st
     try:
         structure = get_directory_structure(path)
         if structure:
+            # Calculate actual counts from the structure
+            actual_total = count_items_in_structure(structure)
+            
             # Add statistics to the response
             structure['files_count'] = files_count
             structure['directories_count'] = directories_count
-            structure['total_items'] = total_items_count
+            structure['total_items'] = actual_total
             
             return {
                 "success": True,
@@ -617,7 +808,8 @@ def _get_repository_codebase_internal(workspace: str, repo_slug: str, branch: st
         else:
             return {
                 "success": False,
-                "error": "Failed to get codebase structure"
+                "error": f"Failed to get codebase structure for repository '{repo_slug}' on branch '{branch}'. This may be due to insufficient permissions. Please ensure your Bitbucket token has 'repository:read' scope.",
+                "suggestion": "Try using a token with repository read permissions, or test with a public repository that you have access to."
             }
     except Exception as e:
         return {
@@ -914,6 +1106,57 @@ def _get_pull_requests_internal(workspace: str, repo_slug: str, state: str = "OP
             "error": f"Exception while getting pull requests: {str(e)}"
         }
 
+def _search_pull_requests_internal(workspace: str, repo_slug: str, search_query: str, state: str = "OPEN", page_size: int = 50) -> Dict[str, Any]:
+    """
+    Internal function to search pull requests by title (not an MCP tool)
+    Used by other functions to search for PRs matching a query
+    """
+    global auth_headers
+    
+    if not auth_headers:
+        # Try to authenticate automatically if email is configured
+        if BITBUCKET_EMAIL:
+            auth_result = _authenticate_internal()
+            if not auth_result.get("success"):
+                return auth_result
+        else:
+            return {
+                "success": False,
+                "error": "Not authenticated. Please authenticate first using authenticate_user() or configure BITBUCKET_EMAIL."
+            }
+    
+    try:
+        # First get all PRs
+        prs_result = _get_pull_requests_internal(workspace, repo_slug, state, page_size)
+        if not prs_result.get("success"):
+            return prs_result
+        
+        all_prs = prs_result.get("pull_requests", [])
+        search_query_lower = search_query.lower()
+        
+        # Filter PRs by title
+        matching_prs = []
+        for pr in all_prs:
+            title = pr.get('title', '').lower()
+            if search_query_lower in title:
+                matching_prs.append(pr)
+        
+        return {
+            "success": True,
+            "workspace": workspace,
+            "repository": repo_slug,
+            "search_query": search_query,
+            "state": state.upper(),
+            "matching_pull_requests": matching_prs,
+            "total_matches": len(matching_prs),
+            "total_prs_searched": len(all_prs)
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Exception while searching pull requests: {str(e)}"
+        }
+
 def _get_pull_request_files_internal(workspace: str, repo_slug: str, pr_id: int) -> Dict[str, Any]:
     """
     Internal function to get files changed in a pull request (not an MCP tool)
@@ -1002,6 +1245,138 @@ def _get_pull_request_files_internal(workspace: str, repo_slug: str, pr_id: int)
             "error": f"Exception while getting pull request files: {str(e)}"
         }
 
+def _get_pull_request_details_internal(workspace: str, repo_slug: str, pr_id: int) -> Dict[str, Any]:
+    """
+    Internal function to get detailed information about a specific pull request (not an MCP tool)
+    Used by other functions to fetch comprehensive PR details
+    """
+    global auth_headers
+    
+    if not auth_headers:
+        # Try to authenticate automatically if email is configured
+        if BITBUCKET_EMAIL:
+            auth_result = _authenticate_internal()
+            if not auth_result.get("success"):
+                return auth_result
+        else:
+            return {
+                "success": False,
+                "error": "Not authenticated. Please authenticate first using authenticate_user() or configure BITBUCKET_EMAIL."
+            }
+    
+    try:
+        # Get the main PR details
+        pr_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/pullrequests/{pr_id}"
+        response = requests.get(pr_url, headers=auth_headers)
+        
+        if response.status_code == 200:
+            pr_data = response.json()
+            
+            # Get PR files/changes
+            files_result = _get_pull_request_files_internal(workspace, repo_slug, pr_id)
+            
+            # Get PR comments
+            comments_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/pullrequests/{pr_id}/comments"
+            comments_response = requests.get(comments_url, headers=auth_headers)
+            comments_data = []
+            if comments_response.status_code == 200:
+                comments_data = comments_response.json().get('values', [])
+            
+            # Get PR activities (commits, comments, etc.)
+            activities_url = f"https://api.bitbucket.org/2.0/repositories/{workspace}/{repo_slug}/pullrequests/{pr_id}/activity"
+            activities_response = requests.get(activities_url, headers=auth_headers)
+            activities_data = []
+            if activities_response.status_code == 200:
+                activities_data = activities_response.json().get('values', [])
+            
+            # Extract key information from PR data
+            pr_details = {
+                "id": pr_data.get('id'),
+                "title": pr_data.get('title'),
+                "description": pr_data.get('description'),
+                "state": pr_data.get('state'),
+                "created_on": pr_data.get('created_on'),
+                "updated_on": pr_data.get('updated_on'),
+                "closed_on": pr_data.get('closed_on'),
+                "merged_on": pr_data.get('merged_on'),
+                "author": {
+                    "display_name": pr_data.get('author', {}).get('display_name'),
+                    "username": pr_data.get('author', {}).get('username'),
+                    "account_id": pr_data.get('author', {}).get('account_id')
+                },
+                "source": {
+                    "branch": pr_data.get('source', {}).get('branch', {}).get('name'),
+                    "commit": pr_data.get('source', {}).get('commit', {}).get('hash'),
+                    "repository": pr_data.get('source', {}).get('repository', {}).get('name')
+                },
+                "destination": {
+                    "branch": pr_data.get('destination', {}).get('branch', {}).get('name'),
+                    "commit": pr_data.get('destination', {}).get('commit', {}).get('hash'),
+                    "repository": pr_data.get('destination', {}).get('repository', {}).get('name')
+                },
+                "reviewers": [],
+                "participants": [],
+                "links": pr_data.get('links', {}),
+                "summary": pr_data.get('summary', {}),
+                "rendered": pr_data.get('rendered', {}),
+                "close_source_branch": pr_data.get('close_source_branch', False),
+                "merge_commit": pr_data.get('merge_commit'),
+                "task_count": pr_data.get('task_count', 0),
+                "comment_count": pr_data.get('comment_count', 0),
+                "approval_count": pr_data.get('approval_count', 0)
+            }
+            
+            # Extract reviewers
+            if 'reviewers' in pr_data:
+                for reviewer in pr_data['reviewers']:
+                    reviewer_info = {
+                        "display_name": reviewer.get('display_name'),
+                        "username": reviewer.get('username'),
+                        "account_id": reviewer.get('account_id'),
+                        "type": reviewer.get('type'),
+                        "approved": reviewer.get('approved', False)
+                    }
+                    pr_details["reviewers"].append(reviewer_info)
+            
+            # Extract participants
+            if 'participants' in pr_data:
+                for participant in pr_data['participants']:
+                    participant_info = {
+                        "display_name": participant.get('display_name'),
+                        "username": participant.get('username'),
+                        "account_id": participant.get('account_id'),
+                        "type": participant.get('type'),
+                        "approved": participant.get('approved', False),
+                        "role": participant.get('role'),
+                        "participated_on": participant.get('participated_on')
+                    }
+                    pr_details["participants"].append(participant_info)
+            
+            return {
+                "success": True,
+                "workspace": workspace,
+                "repository": repo_slug,
+                "pr_id": pr_id,
+                "pull_request": pr_details,
+                "files": files_result.get("files", []) if files_result.get("success") else [],
+                "files_summary": files_result.get("summary", {}) if files_result.get("success") else {},
+                "comments": comments_data,
+                "activities": activities_data,
+                "comment_count": len(comments_data),
+                "activity_count": len(activities_data)
+            }
+        else:
+            return {
+                "success": False,
+                "error": f"Failed to get pull request details: {response.status_code}",
+                "details": response.text
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Exception while getting pull request details: {str(e)}"
+        }
+
 @mcp.tool(name="get_repository_files_list", description="Get a list of all files in a repository without content")
 async def get_repository_files_list(workspace: str, repo_slug: str, branch: str = "main", path: str = "") -> Dict[str, Any]:
     """
@@ -1021,19 +1396,49 @@ async def get_repository_files_list(workspace: str, repo_slug: str, branch: str 
     return result
 
 @mcp.tool(name="get_pull_requests", description="Get pull requests from a repository")
-async def get_pull_requests(workspace: str, repo_slug: str, state: str = "OPEN", page_size: int = 50) -> Dict[str, Any]:
+async def get_pull_requests(workspace: Optional[str] = None, repo_slug: str = None, repo_name: Optional[str] = None, state: str = "OPEN", page_size: int = 50) -> Dict[str, Any]:
     """
     Get pull requests from a repository
     
     Args:
-        workspace: Workspace name/slug
-        repo_slug: Repository slug
+        workspace: Workspace name/slug (optional if repo_name is provided)
+        repo_slug: Repository slug (optional if repo_name is provided)
+        repo_name: Repository name to search for across workspaces (optional if workspace and repo_slug are provided)
         state: PR state (OPEN, MERGED, DECLINED, SUPERSEDED) - default: OPEN
         page_size: Number of PRs per page (default: 50)
     
     Returns:
         List of pull requests with details
     """
+    # If repo_name is provided, find the repository first
+    if repo_name and (not workspace or not repo_slug):
+        repo_search_result = _find_repository_across_workspaces_internal(repo_name, page_size)
+        if not repo_search_result.get("success"):
+            return repo_search_result
+        
+        matches = repo_search_result.get("matches", [])
+        if len(matches) == 1:
+            # Use the single match
+            workspace = matches[0]["workspace_slug"]
+            repo_slug = matches[0]["repository"]["slug"]
+        elif len(matches) > 1:
+            # Return multiple matches for user to choose
+            return {
+                "success": False,
+                "error": f"Multiple repositories found with name '{repo_name}'. Please specify workspace and repo_slug.",
+                "matches": matches,
+                "count": len(matches)
+            }
+        else:
+            return repo_search_result
+    
+    # Validate that we have both workspace and repo_slug
+    if not workspace or not repo_slug:
+        return {
+            "success": False,
+            "error": "Either provide both workspace and repo_slug, or provide repo_name to search across workspaces"
+        }
+    
     # Use the internal pull requests function
     result = _get_pull_requests_internal(workspace, repo_slug, state, page_size)
     return result
@@ -1053,6 +1458,107 @@ async def get_pull_request_files(workspace: str, repo_slug: str, pr_id: int) -> 
     """
     # Use the internal pull request files function
     result = _get_pull_request_files_internal(workspace, repo_slug, pr_id)
+    return result
+
+@mcp.tool(name="search_pull_requests", description="Search pull requests by title using a descriptive query")
+async def search_pull_requests(workspace: Optional[str] = None, repo_slug: str = None, repo_name: Optional[str] = None, search_query: str = "", state: str = "OPEN", page_size: int = 50) -> Dict[str, Any]:
+    """
+    Search pull requests by title using a descriptive query
+    
+    Args:
+        workspace: Workspace name/slug (optional if repo_name is provided)
+        repo_slug: Repository slug (optional if repo_name is provided)
+        repo_name: Repository name to search for across workspaces (optional if workspace and repo_slug are provided)
+        search_query: Search query to match against PR titles (case-insensitive)
+        state: PR state: OPEN, MERGED, DECLINED, SUPERSEDED (default: OPEN)
+        page_size: Number of PRs per page (default: 50)
+    
+    Returns:
+        List of pull requests matching the search query with their IDs and content
+    """
+    # If repo_name is provided, find the repository first
+    if repo_name and (not workspace or not repo_slug):
+        repo_search_result = _find_repository_across_workspaces_internal(repo_name, page_size)
+        if not repo_search_result.get("success"):
+            return repo_search_result
+        
+        matches = repo_search_result.get("matches", [])
+        if len(matches) == 1:
+            # Use the single match
+            workspace = matches[0]["workspace_slug"]
+            repo_slug = matches[0]["repository"]["slug"]
+        elif len(matches) > 1:
+            # Return multiple matches for user to choose
+            return {
+                "success": False,
+                "error": f"Multiple repositories found with name '{repo_name}'. Please specify workspace and repo_slug.",
+                "matches": matches,
+                "count": len(matches)
+            }
+        else:
+            return repo_search_result
+    
+    # Validate that we have both workspace and repo_slug
+    if not workspace or not repo_slug:
+        return {
+            "success": False,
+            "error": "Either provide both workspace and repo_slug, or provide repo_name to search across workspaces"
+        }
+    
+    return _search_pull_requests_internal(workspace, repo_slug, search_query, state, page_size)
+
+@mcp.tool(name="get_pull_request_details", description="Get comprehensive details about a specific pull request by ID")
+async def get_pull_request_details(workspace: Optional[str] = None, repo_slug: str = None, repo_name: Optional[str] = None, pr_id: int = None) -> Dict[str, Any]:
+    """
+    Get comprehensive details about a specific pull request by ID
+    
+    Args:
+        workspace: Workspace name/slug (optional if repo_name is provided)
+        repo_slug: Repository slug (optional if repo_name is provided)
+        repo_name: Repository name to search for across workspaces (optional if workspace and repo_slug are provided)
+        pr_id: Pull Request ID
+    
+    Returns:
+        Comprehensive pull request details including:
+        - Basic PR information (title, description, state, dates)
+        - Author and participant information
+        - Source and destination branch details
+        - Reviewers and their approval status
+        - Files changed with change statistics
+        - Comments and activities
+        - Links and metadata
+    """
+    # If repo_name is provided, find the repository first
+    if repo_name and (not workspace or not repo_slug):
+        repo_search_result = _find_repository_across_workspaces_internal(repo_name, 50)
+        if not repo_search_result.get("success"):
+            return repo_search_result
+        
+        matches = repo_search_result.get("matches", [])
+        if len(matches) == 1:
+            # Use the single match
+            workspace = matches[0]["workspace_slug"]
+            repo_slug = matches[0]["repository"]["slug"]
+        elif len(matches) > 1:
+            # Return multiple matches for user to choose
+            return {
+                "success": False,
+                "error": f"Multiple repositories found with name '{repo_name}'. Please specify workspace and repo_slug.",
+                "matches": matches,
+                "count": len(matches)
+            }
+        else:
+            return repo_search_result
+    
+    # Validate that we have all required parameters
+    if not workspace or not repo_slug or pr_id is None:
+        return {
+            "success": False,
+            "error": "Either provide both workspace and repo_slug, or provide repo_name to search across workspaces. PR ID is required."
+        }
+    
+    # Use the internal pull request details function
+    result = _get_pull_request_details_internal(workspace, repo_slug, pr_id)
     return result
 
 @mcp.tool(name="save_codebase_to_file", description="Save the repository codebase structure to a JSON file")
